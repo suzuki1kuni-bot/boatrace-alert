@@ -1,0 +1,19 @@
+name: Morning Scanner
+
+on:
+  schedule:
+    - cron: '0 23 * * *'  # 毎日 日本時間 8:00 に自動起動
+  workflow_dispatch:      # 手動実行ボタン
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - run: pip install requests beautifulsoup4
+      - run: python morning_scanner.py
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
