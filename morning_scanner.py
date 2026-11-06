@@ -1,13 +1,9 @@
-import requests, re, sys, time, itertools, math, os
+import requests, re, sys, time, os
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 
-# =========================================================
-# ⚙️ 設定エリア
-# =========================================================
-# 先ほど取得したDiscordのWebhook URLを貼り付けます（環境変数からも取得可能）
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "ここにDiscordのWebhook_URLを貼り付け")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 最低キーマンスコア = 2.5
 イン逃げ率上限 = 65.0
@@ -18,17 +14,19 @@ VENUE_DICT = {v: f"{i+1:02d}" for i, v in enumerate(VENUES)}
 def fetch_racelist_fast(session, venue, rno, date_str):
     jcd = VENUE_DICT.get(venue)
     u = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd}&hd={date_str}"
-    try:
-        r = session.get(u, timeout=8)
-        if "データがありません" in r.text: return None
-        return BeautifulSoup(r.text, 'html.parser'), r.text
-    except: return None
+    # 海外サーバー対策：リトライ処理
+    for _ in range(2):
+        try:
+            r = session.get(u, timeout=12)
+            if "データがありません" in r.text: return None
+            return BeautifulSoup(r.text, 'html.parser'), r.text
+        except: time.sleep(0.5)
+    return None
 
 def scan_single_race(s_l, raw_txt):
     tb_l = s_l.find_all('tbody', class_='is-fs12')[:6]
     if len(tb_l) < 6: return None
     
-    # 締切予定時刻の取得
     m_time = re.search(r'電投締切\s*(\d{2}:\d{2})', raw_txt)
     close_time = m_time.group(1) if m_time else "未定"
     
@@ -52,71 +50,107 @@ def scan_single_race(s_l, raw_txt):
         mot = float(mot_m[0]) if mot_m else 33.0
         boats[w] = {'name': name, 'rank': rank, 'st': st_avg, 'f': f_hold, 'nat': nat, 'mot': mot}
         
-    c1, c2 = boats[1], boats[2]
+    c1 = boats[1]
     
-    # 1. イン崩壊リスク判定 (イン逃げ率 <= 65%)
-    in_trust = min(92.0, max(25.0, 32.0 + (c1['nat'] * 7.0)))
-    if in_trust > イン逃げ率上限: return None
-    
-    # 2. キーマン特定判定 (2〜4号艇に限定)
-    key_candidates = {}
+    # ★【改修①】：外の攻め手 (2~4号艇) のパワーと優位性を先に算出
+    attack_powers = {}
     key_reasons = {}
-    for c_idx in [2, 3, 4]:
-        c_info = boats[c_idx]
-        power = 0.0
+    for c in [2, 3, 4]:
+        b = boats[c]
+        pwr = 0.0
         reasons = []
-        if c_info['rank'] in ['A1', 'A2'] and c1['rank'] in ['B1', 'B2']:
-            power += 2.5; reasons.append(f"格上{c_info['rank']}")
-        elif c_info['rank'] == 'A1':
-            power += 1.5; reasons.append("実力A1")
-        if c_info['mot'] >= 40.0:
-            power += 1.5; reasons.append(f"好機{c_info['mot']:.1f}%")
-        if c_info['st'] <= c1['st'] - 0.02:
-            power += 1.2; reasons.append(f"ST優勢({c_info['st']:.2f})")
-            
-        pos_w = 1.2 if c_idx in [3, 4] else 1.1
-        power *= pos_w
-        key_candidates[c_idx] = power
-        key_reasons[c_idx] = reasons
         
-    best_key = max(key_candidates, key=key_candidates.get)
-    best_power = key_candidates[best_key]
+        # 勝率差・実力差
+        win_diff = b['nat'] - c1['nat']
+        if win_diff >= 1.0: pwr += 2.0; reasons.append(f"勝率差+{win_diff:.1f}")
+        elif win_diff > 0.0: pwr += 1.0
+        
+        if b['rank'] == 'A1' and c1['rank'] != 'A1': pwr += 1.8; reasons.append("実力A1")
+        elif b['rank'] in ['A1', 'A2'] and c1['rank'] in ['B1', 'B2']: pwr += 1.5; reasons.append(f"格上{b['rank']}")
+        
+        # 機力差
+        if b['mot'] >= 40.0: pwr += 1.5; reasons.append(f"好機{b['mot']:.1f}%")
+        if b['mot'] - c1['mot'] >= 10.0: pwr += 1.0; reasons.append("機力優勢")
+        
+        # ST差
+        st_diff = c1['st'] - b['st']
+        if st_diff >= 0.03: pwr += 2.0; reasons.append(f"ST大幅優勢({b['st']:.2f})")
+        elif st_diff >= 0.015: pwr += 1.2; reasons.append(f"ST優勢({b['st']:.2f})")
+        
+        pos_w = 1.2 if c in [3, 4] else 1.1
+        pwr *= pos_w
+        attack_powers[c] = pwr
+        key_reasons[c] = reasons
+        
+    best_key = max(attack_powers, key=attack_powers.get)
+    max_attack = attack_powers[best_key]
     
-    if best_power < 最低キーマンスコア or not key_reasons[best_key]:
+    # キーマン足切り（明確な武器がなければ混戦として除外）
+    if max_attack < 最低キーマンスコア or not key_reasons[best_key]:
         return None
+        
+    # ★【改修②】：外の怪物の脅威を正当に反映したイン信頼度計算
+    base_in = 32.0 + (c1['nat'] * 5.5)
+    if c1['f'] >= 2: base_in -= 18.0
+    elif c1['f'] == 1: base_in -= 9.0
+    if c1['mot'] < 28.0: base_in -= 8.0
+    
+    # 2コース壁凹み判定
+    if boats[2]['rank'] == 'B2' or boats[2]['st'] >= 0.19:
+        base_in -= 8.0
+        
+    # 外の強烈な刺客によるイン信頼度引き下げ！
+    if max_attack >= 4.5: base_in -= 14.0
+    elif max_attack >= 2.5: base_in -= 7.0
+    
+    in_trust = min(92.0, max(15.0, base_in))
+    if in_trust > イン逃げ率上限:
+        return None # イン鉄板除外
         
     pts = 12 if best_key == 2 else 14
     return {
         'key_boat': best_key, 'key_name': boats[best_key]['name'], 'key_rank': boats[best_key]['rank'],
-        'power': best_power, 'reasons': key_reasons[best_key], 'points': pts,
+        'power': max_attack, 'reasons': key_reasons[best_key], 'points': pts,
         'c1_name': c1['name'], 'c1_rank': c1['rank'], 'c1_win': c1['nat'],
-        'close_time': close_time
+        'in_trust': in_trust, 'close_time': close_time
     }
 
-def send_discord_notification(message):
-    if "http" not in DISCORD_WEBHOOK_URL:
-        print("⚠️ Discord Webhook URLが設定されていません。コンソール出力のみ行います。")
+def send_discord_notification(full_message):
+    if not DISCORD_WEBHOOK_URL or "http" not in DISCORD_WEBHOOK_URL:
+        print("Webhook URLが未設定です")
         return
-    payload = {"content": message}
-    try:
-        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Discord通知エラー: {e}")
+        
+    # ★【改修③】：Discord 2,000文字上限対策（自動分割送信）
+    lines = full_message.split('\n')
+    chunks = []
+    curr = ""
+    for line in lines:
+        if len(curr) + len(line) + 1 > 1850:
+            chunks.append(curr.strip())
+            curr = line + '\n'
+        else:
+            curr += line + '\n'
+    if curr.strip():
+        chunks.append(curr.strip())
+        
+    for chk in chunks:
+        try:
+            requests.post(DISCORD_WEBHOOK_URL, json={"content": chk}, timeout=10)
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"Discord送信エラー: {e}")
 
 def main():
-    # 日本時間（JST）の当日日付を取得
     JST = timezone(timedelta(hours=9), 'JST')
     today_str = datetime.now(JST).strftime("%Y%m%d")
     today_display = datetime.now(JST).strftime("%Y/%m/%d (%a)")
     
-    print(f"🌅 【朝の全国一括スキャン開始】: {today_display}")
     session = requests.Session()
     session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
     
-    # 本日開催場を高速検出
     active_venues = []
     with ThreadPoolExecutor(max_workers=12) as ex:
-        futures = {ex.submit(session.get, f"https://www.boatrace.jp/owpc/pc/race/racelist?rno=1&jcd={VENUE_DICT[v]}&hd={today_str}", timeout=8): v for v in VENUES}
+        futures = {ex.submit(session.get, f"https://www.boatrace.jp/owpc/pc/race/racelist?rno=1&jcd={VENUE_DICT[v]}&hd={today_str}", timeout=10): v for v in VENUES}
         for f in futures:
             v = futures[f]
             try:
@@ -124,7 +158,6 @@ def main():
             except: pass
                 
     active_venues.sort(key=lambda x: VENUES.index(x))
-    print(f"✅ 本日の開催場（{len(active_venues)}場）: {', '.join(active_venues)}")
     
     hunted_races = []
     for venue in active_venues:
@@ -138,16 +171,16 @@ def main():
             res['venue'] = venue
             res['rno'] = rno
             hunted_races.append(res)
-        time.sleep(0.1)
+        time.sleep(0.08)
         
     hunted_races.sort(key=lambda x: x['power'], reverse=True)
     
-    # メッセージの組み立て
     msg = f"🌅 **【朝のイン崩壊・波乱予備軍レース】 {today_display}**\n"
-    msg += f"全国 {len(active_venues)*12}R 中、イン崩壊シグナル＆キーマン特定: **{len(hunted_races)} レース**\n\n"
+    msg += f"本日開催: {', '.join(active_venues)} ({len(active_venues)*12}R)\n"
+    msg += f"勝負候補レース: **{len(hunted_races)} レース検出**\n\n"
     
     if not hunted_races:
-        msg += "⚠️ **本日は条件を満たすレースがありません。完全見送りを推奨します。**"
+        msg += "⚠️ **本日は条件を満たす波乱レースがありません。完全見送りを推奨します。**"
     else:
         for i, r in enumerate(hunted_races, 1):
             msg += f"**#{i} {r['venue']} {r['rno']}R** (締切 ⏰ **{r['close_time']}**)\n"
@@ -159,7 +192,6 @@ def main():
         
     print(msg)
     send_discord_notification(msg)
-    print("\n✅ スマホへの通知送信が完了しました！")
 
 if __name__ == "__main__":
     main()
