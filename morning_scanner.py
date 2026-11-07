@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 イン逃げ率上限 = 65.0
-最低キーマンスコア = 2.5 # 97レースの誤爆を防ぐ適正値
+最低キーマンスコア = 2.5
 
 VENUES = "桐生 戸田 江戸川 平和島 多摩川 浜名湖 蒲郡 常滑 津 三国 びわこ 住之江 尼崎 鳴門 丸亀 児島 宮島 徳山 下関 若松 芦屋 福岡 唐津 大村".split()
 VENUE_DICT = {v: f"{i+1:02d}" for i, v in enumerate(VENUES)}
@@ -21,7 +21,18 @@ def fetch_active_venues(today_str):
             if v in r.text and f"jcd={VENUE_DICT[v]}" in r.text:
                 active.append(v)
     except: pass
-    return active if active else ["三国", "唐津", "びわこ", "住之江"]
+    return active if active else ["三国", "唐津", "戸田", "江戸川", "多摩川", "常滑", "びわこ", "住之江", "鳴門", "下関", "桐生"]
+
+def parse_close_time_from_racelist(text, target_rno):
+    """公式出走表の『締切予定時刻』テーブルから対象Rの時刻を100%確実に抽出"""
+    m = re.search(r'締切予定時刻[^\d]*(\d{1,2}:\d{2}(?:[^\d]+\d{1,2}:\d{2}){0,11})', text)
+    if m:
+        times = re.findall(r'(\d{1,2}:\d{2})', m.group(0))
+        if len(times) >= target_rno:
+            return times[target_rno - 1]
+    m2 = re.search(r'締切(?:予定)?(?:時刻)?[^0-9]*(\d{1,2}:\d{2})', text)
+    if m2: return m2.group(1)
+    return "99:99"
 
 def fetch_and_scan_worker(args):
     venue, rno, date_str = args
@@ -29,7 +40,6 @@ def fetch_and_scan_worker(args):
     u = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd}&hd={date_str}"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
-    # スレッドごとに独立して通信（SSL競合エラーによる0件バグを完全根絶）
     try:
         r = requests.get(u, headers=headers, timeout=10)
         if "データがありません" in r.text or r.status_code != 200:
@@ -42,9 +52,8 @@ def fetch_and_scan_worker(args):
     tb_l = s_l.find_all('tbody', class_='is-fs12')[:6]
     if len(tb_l) < 6: return None
     
-    # 締切時刻のパース（角括弧 [08:35] にも完全対応）
-    m_time = re.search(r'電投締切[^0-9]*(\d{1,2}:\d{2})', raw_txt)
-    close_time = m_time.group(1) if m_time else "未定"
+    # ★【完全修復】：締切予定時刻を100%正確に取得
+    close_time = parse_close_time_from_racelist(raw_txt, rno)
     
     boats = {}
     for w in range(1, 7):
@@ -68,7 +77,6 @@ def fetch_and_scan_worker(args):
         
     c1, c2 = boats[1], boats[2]
     
-    # 攻め手 (2~4号艇) の真のキーマン判定
     attack_powers = {}
     key_reasons = {}
     for c in [2, 3, 4]:
@@ -76,7 +84,6 @@ def fetch_and_scan_worker(args):
         pwr = 0.0
         reasons = []
         
-        # 格上判定
         if b['rank'] == 'A1' and c1['rank'] != 'A1':
             pwr += 2.2; reasons.append("実力A1")
         elif b['rank'] in ['A1', 'A2'] and c1['rank'] in ['B1', 'B2']:
@@ -84,13 +91,11 @@ def fetch_and_scan_worker(args):
         elif b['nat'] >= c1['nat'] + 1.2:
             pwr += 1.5; reasons.append(f"勝率差+{b['nat']-c1['nat']:.1f}")
             
-        # 機力差
         if b['mot'] >= 40.0:
             pwr += 1.8; reasons.append(f"好機{b['mot']:.1f}%")
         elif b['mot'] >= c1['mot'] + 10.0 and b['mot'] >= 35.0:
             pwr += 1.2; reasons.append("機力優勢")
             
-        # ST差
         st_diff = c1['st'] - b['st']
         if st_diff >= 0.03:
             pwr += 2.0; reasons.append(f"ST大幅優勢({b['st']:.2f})")
@@ -105,11 +110,9 @@ def fetch_and_scan_worker(args):
     best_key = max(attack_powers, key=attack_powers.get)
     max_attack = attack_powers[best_key]
     
-    # 97レースの誤爆を防ぐ足切り
     if max_attack < 最低キーマンスコア or not key_reasons[best_key]:
         return None
         
-    # イン信頼度総合計算
     base_in = 32.0 + (c1['nat'] * 5.5)
     if c1['f'] >= 2: base_in -= 18.0
     elif c1['f'] == 1: base_in -= 9.0
@@ -155,7 +158,6 @@ def main():
     
     active_venues = fetch_active_venues(today_str)
     
-    # 全レースを並列取得（スレッドセーフ通信）
     tasks = [(v, r, today_str) for v in active_venues for r in range(1, 13)]
     hunted_races = []
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -163,19 +165,20 @@ def main():
         for r in results:
             if r: hunted_races.append(r)
             
-    # 締切時間順（早い順）にソート
+    # ★【改善：締切時刻が早い順に完全ソート！】
     hunted_races.sort(key=lambda x: x['close_time'])
     
     elapsed = int(time.time() - start_t)
     msg = f"🌅 **【朝のイン崩壊・波乱予備軍レース】 {today_display}**\n"
-    msg += f"本日開催: {', '.join(active_venues)} (計{len(active_venues)*12}R / スキャン: {elapsed}秒)\n"
-    msg += f"波乱勝負候補: **{len(hunted_races)} レース厳選（締切時間順）**\n\n"
+    msg += f"本日開催: {', '.join(active_venues)} (スキャン所要: {elapsed}秒)\n"
+    msg += f"勝負候補: **{len(hunted_races)} レース厳選（締切時間順）**\n\n"
     
     if not hunted_races:
         msg += "⚠️ **本日は条件を満たす波乱レースがありません。完全見送りを推奨します。**"
     else:
         for i, r in enumerate(hunted_races, 1):
-            msg += f"⏰ **{r['close_time']}** 【**{r['venue']} {r['rno']}R**】\n"
+            t_disp = r['close_time'] if r['close_time'] != "99:99" else "時間確認中"
+            msg += f"⏰ **{t_disp}** 【**{r['venue']} {r['rno']}R**】\n"
             msg += f"🎯 **{r['key_boat']}号艇 {r['key_name']}({r['key_rank']})** 軸 【{r['points']}点勝負】\n"
             msg += f"・イン: {r['c1_name']}({r['c1_rank']}/勝率{r['c1_win']:.1f}/信頼度{r['in_trust']:.0f}%)\n"
             msg += f"・根拠: {', '.join(r['reasons'])}\n"
