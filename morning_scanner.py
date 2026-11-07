@@ -24,28 +24,21 @@ def fetch_active_venues(today_str):
     return active if active else ["三国", "唐津", "戸田", "江戸川", "多摩川", "常滑", "びわこ", "住之江", "鳴門", "下関", "桐生"]
 
 def parse_bulletproof_close_time(html_text, rno):
-    """【完全無欠パーサー】class='is-fs14'等のタグ内数字に邪魔されず、1R~12Rの締切時刻を100%直接抽出"""
-    # 1. 最優先: 「締切予定時刻」を含む <tr>...</tr> 行を丸ごと抜き出し、その中の <td> から rno 番目を引く
+    """【完全無欠パーサー】クラス名のis-fs14に邪魔されず対象Rの時刻を100%抽出"""
     m_tr = re.search(r'<tr[^>]*>.*?締切予定時刻.*?</tr>', html_text, re.DOTALL)
     if m_tr:
         tr_content = m_tr.group(0)
         td_values = re.findall(r'<td[^>]*>\s*(\d{1,2}:\d{2})\s*</td>', tr_content)
         if len(td_values) >= rno:
             return td_values[rno - 1].strip()
-            
-    # 2. 第2優先: タグを除去したクリーンテキストから「締切予定時刻」のリストを引く
     clean_txt = re.sub(r'<[^>]+>', ' ', html_text)
     m_txt = re.search(r'締切予定時刻.*', clean_txt)
     if m_txt:
         times = re.findall(r'(\d{1,2}:\d{2})', m_txt.group(0))
         if len(times) >= rno:
             return times[rno - 1].strip()
-            
-    # 3. 第3優先: 電投締切
     m_dento = re.search(r'電投締切[^0-9]*(\d{1,2}:\d{2})', clean_txt)
-    if m_dento:
-        return m_dento.group(1).strip()
-        
+    if m_dento: return m_dento.group(1).strip()
     return "99:99"
 
 def fetch_and_scan_worker(args):
@@ -53,20 +46,15 @@ def fetch_and_scan_worker(args):
     jcd = VENUE_DICT.get(venue)
     u = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd}&hd={date_str}"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    
     try:
         r = requests.get(u, headers=headers, timeout=10)
-        if "データがありません" in r.text or r.status_code != 200:
-            return None
+        if "データがありません" in r.text or r.status_code != 200: return None
         raw_txt = r.text
         s_l = BeautifulSoup(raw_txt, 'html.parser')
-    except:
-        return None
+    except: return None
         
     tb_l = s_l.find_all('tbody', class_='is-fs12')[:6]
     if len(tb_l) < 6: return None
-    
-    # ★【バグ根絶】：タグ内のis-fs14に惑わされず、rno番目の締切時刻を100%直接抽出
     close_time = parse_bulletproof_close_time(raw_txt, rno)
     
     boats = {}
@@ -90,32 +78,22 @@ def fetch_and_scan_worker(args):
         boats[w] = {'name': name, 'rank': rank, 'st': st_avg, 'f': f_hold, 'nat': nat, 'mot': mot}
         
     c1, c2 = boats[1], boats[2]
-    
     attack_powers = {}
     key_reasons = {}
     for c in [2, 3, 4]:
         b = boats[c]
         pwr = 0.0
         reasons = []
-        
-        if b['rank'] == 'A1' and c1['rank'] != 'A1':
-            pwr += 2.2; reasons.append("実力A1")
-        elif b['rank'] in ['A1', 'A2'] and c1['rank'] in ['B1', 'B2']:
-            pwr += 2.0; reasons.append(f"格上{b['rank']}")
-        elif b['nat'] >= c1['nat'] + 1.2:
-            pwr += 1.5; reasons.append(f"勝率差+{b['nat']-c1['nat']:.1f}")
-            
-        if b['mot'] >= 40.0:
-            pwr += 1.8; reasons.append(f"好機{b['mot']:.1f}%")
-        elif b['mot'] >= c1['mot'] + 10.0 and b['mot'] >= 35.0:
-            pwr += 1.2; reasons.append("機力優勢")
-            
+        win_diff = b['nat'] - c1['nat']
+        if win_diff >= 1.0: pwr += 2.0; reasons.append(f"勝率差+{win_diff:.1f}")
+        elif win_diff > 0.3: pwr += 1.0
+        if b['rank'] == 'A1' and c1['rank'] != 'A1': pwr += 2.2; reasons.append("実力A1")
+        elif b['rank'] in ['A1', 'A2'] and c1['rank'] in ['B1', 'B2']: pwr += 2.0; reasons.append(f"格上{b['rank']}")
+        if b['mot'] >= 40.0: pwr += 1.8; reasons.append(f"好機{b['mot']:.1f}%")
+        elif b['mot'] - c1['mot'] >= 8.0: pwr += 1.2; reasons.append("機力優勢")
         st_diff = c1['st'] - b['st']
-        if st_diff >= 0.03:
-            pwr += 2.0; reasons.append(f"ST大幅優勢({b['st']:.2f})")
-        elif st_diff >= 0.02:
-            pwr += 1.2; reasons.append(f"ST優勢({b['st']:.2f})")
-            
+        if st_diff >= 0.03: pwr += 2.0; reasons.append(f"ST大幅優勢({b['st']:.2f})")
+        elif st_diff >= 0.02: pwr += 1.2; reasons.append(f"ST優勢({b['st']:.2f})")
         pos_w = 1.2 if c in [3, 4] else 1.1
         power = pwr * pos_w
         attack_powers[c] = power
@@ -123,19 +101,15 @@ def fetch_and_scan_worker(args):
         
     best_key = max(attack_powers, key=attack_powers.get)
     max_attack = attack_powers[best_key]
-    
-    if max_attack < 最低キーマンスコア or not key_reasons[best_key]:
-        return None
+    if max_attack < 最低キーマンスコア or not key_reasons[best_key]: return None
         
     base_in = 32.0 + (c1['nat'] * 5.5)
     if c1['f'] >= 2: base_in -= 18.0
     elif c1['f'] == 1: base_in -= 9.0
     if c1['mot'] < 28.0: base_in -= 8.0
     if c2['rank'] == 'B2' or c2['st'] >= 0.19: base_in -= 8.0
-    
     if max_attack >= 4.0: base_in -= 14.0
     elif max_attack >= 2.5: base_in -= 7.0
-    
     in_trust = min(92.0, max(15.0, base_in))
     if in_trust > イン逃げ率上限: return None
         
@@ -144,8 +118,7 @@ def fetch_and_scan_worker(args):
         'venue': venue, 'rno': rno, 'close_time': close_time,
         'key_boat': best_key, 'key_name': boats[best_key]['name'], 'key_rank': boats[best_key]['rank'],
         'power': max_attack, 'reasons': key_reasons[best_key], 'points': pts,
-        'c1_name': c1['name'], 'c1_rank': c1['rank'], 'c1_win': c1['nat'],
-        'in_trust': in_trust
+        'c1_name': c1['name'], 'c1_rank': c1['rank'], 'c1_win': c1['nat'], 'in_trust': in_trust
     }
 
 def send_discord_notification(full_message):
@@ -169,24 +142,18 @@ def main():
     JST = timezone(timedelta(hours=9), 'JST')
     today_str = datetime.now(JST).strftime("%Y%m%d")
     today_display = datetime.now(JST).strftime("%Y/%m/%d (%a)")
-    
     active_venues = fetch_active_venues(today_str)
-    
     tasks = [(v, r, today_str) for v in active_venues for r in range(1, 13)]
     hunted_races = []
     with ThreadPoolExecutor(max_workers=8) as ex:
         results = ex.map(fetch_and_scan_worker, tasks)
         for r in results:
             if r: hunted_races.append(r)
-            
-    # ★【完全時間順ソート】
     hunted_races.sort(key=lambda x: x['close_time'])
-    
     elapsed = int(time.time() - start_t)
     msg = f"🌅 **【朝のイン崩壊・波乱予備軍レース】 {today_display}**\n"
     msg += f"本日開催: {', '.join(active_venues)} (スキャン所要: {elapsed}秒)\n"
     msg += f"勝負候補: **{len(hunted_races)} レース厳選（締切時間順）**\n\n"
-    
     if not hunted_races:
         msg += "⚠️ **本日は条件を満たす波乱レースがありません。完全見送りを推奨します。**"
     else:
@@ -198,7 +165,6 @@ def main():
             msg += f"・根拠: {', '.join(r['reasons'])}\n"
             msg += "───────────────────\n"
         msg += "\n💡 **【直前チェック】** 締切10分前にColabを実行し、全買い目20倍以上なら投票してください！"
-        
     print(msg)
     send_discord_notification(msg)
 
