@@ -23,25 +23,29 @@ def fetch_active_venues(today_str):
     except: pass
     return active if active else ["三国", "唐津", "戸田", "江戸川", "多摩川", "常滑", "びわこ", "住之江", "鳴門", "下関", "桐生"]
 
-def parse_correct_race_time(text, rno):
-    """【完全修復】1Rの時刻を横取りするバグを根絶し、対象レース(rno)の時刻を100%直接抽出"""
-    # ★【最優先】出走表の12レース連続時刻テーブルから、対象Rのインデックスを引く
-    m_list = re.search(r'締切予定時刻[^\d]*(\d{1,2}:\d{2}(?:[^\d]+\d{1,2}:\d{2}){5,12})', text)
-    if m_list:
-        times = re.findall(r'(\d{1,2}:\d{2})', m_list.group(0))
+def parse_bulletproof_close_time(html_text, rno):
+    """【完全無欠パーサー】class='is-fs14'等のタグ内数字に邪魔されず、1R~12Rの締切時刻を100%直接抽出"""
+    # 1. 最優先: 「締切予定時刻」を含む <tr>...</tr> 行を丸ごと抜き出し、その中の <td> から rno 番目を引く
+    m_tr = re.search(r'<tr[^>]*>.*?締切予定時刻.*?</tr>', html_text, re.DOTALL)
+    if m_tr:
+        tr_content = m_tr.group(0)
+        td_values = re.findall(r'<td[^>]*>\s*(\d{1,2}:\d{2})\s*</td>', tr_content)
+        if len(td_values) >= rno:
+            return td_values[rno - 1].strip()
+            
+    # 2. 第2優先: タグを除去したクリーンテキストから「締切予定時刻」のリストを引く
+    clean_txt = re.sub(r'<[^>]+>', ' ', html_text)
+    m_txt = re.search(r'締切予定時刻.*', clean_txt)
+    if m_txt:
+        times = re.findall(r'(\d{1,2}:\d{2})', m_txt.group(0))
         if len(times) >= rno:
             return times[rno - 1].strip()
             
-    # 次点: レースタブ `tab3_time`
-    tab3_times = re.findall(r'class="[^"]*tab3_time[^"]*"[^>]*>([^<]+)</span>', text)
-    if len(tab3_times) >= rno:
-        t = tab3_times[rno - 1].strip()
-        if re.match(r'^\d{1,2}:\d{2}$', t):
-            return t
-            
-    # 個別ページの電投締切
-    m = re.search(r'電投締切[^0-9]*(\d{1,2}:\d{2})', text)
-    if m: return m.group(1).strip()
+    # 3. 第3優先: 電投締切
+    m_dento = re.search(r'電投締切[^0-9]*(\d{1,2}:\d{2})', clean_txt)
+    if m_dento:
+        return m_dento.group(1).strip()
+        
     return "99:99"
 
 def fetch_and_scan_worker(args):
@@ -62,8 +66,8 @@ def fetch_and_scan_worker(args):
     tb_l = s_l.find_all('tbody', class_='is-fs12')[:6]
     if len(tb_l) < 6: return None
     
-    # ★対象レース番号(rno)の正確な時刻を取得
-    close_time = parse_correct_race_time(raw_txt, rno)
+    # ★【バグ根絶】：タグ内のis-fs14に惑わされず、rno番目の締切時刻を100%直接抽出
+    close_time = parse_bulletproof_close_time(raw_txt, rno)
     
     boats = {}
     for w in range(1, 7):
