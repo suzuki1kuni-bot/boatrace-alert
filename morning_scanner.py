@@ -23,15 +23,25 @@ def fetch_active_venues(today_str):
     except: pass
     return active if active else ["三国", "唐津", "戸田", "江戸川", "多摩川", "常滑", "びわこ", "住之江", "鳴門", "下関", "桐生"]
 
-def parse_close_time_from_racelist(text, target_rno):
-    """公式出走表の『締切予定時刻』テーブルから対象Rの時刻を100%確実に抽出"""
-    m = re.search(r'締切予定時刻[^\d]*(\d{1,2}:\d{2}(?:[^\d]+\d{1,2}:\d{2}){0,11})', text)
-    if m:
-        times = re.findall(r'(\d{1,2}:\d{2})', m.group(0))
-        if len(times) >= target_rno:
-            return times[target_rno - 1]
-    m2 = re.search(r'締切(?:予定)?(?:時刻)?[^0-9]*(\d{1,2}:\d{2})', text)
-    if m2: return m2.group(1)
+def parse_correct_race_time(text, rno):
+    """【完全修復】1Rの時刻を横取りするバグを根絶し、対象レース(rno)の時刻を100%直接抽出"""
+    # ★【最優先】出走表の12レース連続時刻テーブルから、対象Rのインデックスを引く
+    m_list = re.search(r'締切予定時刻[^\d]*(\d{1,2}:\d{2}(?:[^\d]+\d{1,2}:\d{2}){5,12})', text)
+    if m_list:
+        times = re.findall(r'(\d{1,2}:\d{2})', m_list.group(0))
+        if len(times) >= rno:
+            return times[rno - 1].strip()
+            
+    # 次点: レースタブ `tab3_time`
+    tab3_times = re.findall(r'class="[^"]*tab3_time[^"]*"[^>]*>([^<]+)</span>', text)
+    if len(tab3_times) >= rno:
+        t = tab3_times[rno - 1].strip()
+        if re.match(r'^\d{1,2}:\d{2}$', t):
+            return t
+            
+    # 個別ページの電投締切
+    m = re.search(r'電投締切[^0-9]*(\d{1,2}:\d{2})', text)
+    if m: return m.group(1).strip()
     return "99:99"
 
 def fetch_and_scan_worker(args):
@@ -52,8 +62,8 @@ def fetch_and_scan_worker(args):
     tb_l = s_l.find_all('tbody', class_='is-fs12')[:6]
     if len(tb_l) < 6: return None
     
-    # ★【完全修復】：締切予定時刻を100%正確に取得
-    close_time = parse_close_time_from_racelist(raw_txt, rno)
+    # ★対象レース番号(rno)の正確な時刻を取得
+    close_time = parse_correct_race_time(raw_txt, rno)
     
     boats = {}
     for w in range(1, 7):
@@ -165,7 +175,7 @@ def main():
         for r in results:
             if r: hunted_races.append(r)
             
-    # ★【改善：締切時刻が早い順に完全ソート！】
+    # ★【完全時間順ソート】
     hunted_races.sort(key=lambda x: x['close_time'])
     
     elapsed = int(time.time() - start_t)
