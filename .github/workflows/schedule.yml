@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 # ---------------------------------------------------------
 # ⚙️ 設定・定数
 # ---------------------------------------------------------
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 VENUES = [
     "桐生", "戸田", "江戸川", "平和島", "多摩川", "浜名湖", "蒲郡", "常滑", "津", "三国", "びわこ", "住之江",
@@ -27,7 +27,6 @@ SESSION.headers.update({
 # 🛠️ ユーティリティ関数
 # ---------------------------------------------------------
 def safe_float(text, default=0.0):
-    """文字列から安全に数値を抽出する（ハイフンなどの欠損値対策）"""
     try:
         clean = re.sub(r'[^\d.]', '', str(text))
         return float(clean) if clean else default
@@ -35,7 +34,6 @@ def safe_float(text, default=0.0):
         return default
 
 def fetch_racelist(jcd, rno, date_str):
-    """指定した会場・レースの出走表HTMLを取得"""
     url = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     try:
         res = SESSION.get(url, timeout=10)
@@ -48,19 +46,15 @@ def fetch_racelist(jcd, rno, date_str):
         return None
 
 def parse_boat_data(tbody):
-    """1艇分のHTMLデータをパースして辞書化"""
     tds = tbody.find_all('td')
     if len(tds) < 7: return None
 
-    # 級別 (A1, A2, B1, B2)
     rank_match = re.search(r'(A1|A2|B1|B2)', tds[2].get_text())
     rank = rank_match.group(1) if rank_match else "B1"
 
-    # F持ち数
     f_match = re.search(r'F(\d)', tds[3].get_text())
     f_count = int(f_match.group(1)) if f_match else 0
 
-    # 勝率系 (テキストを空白で分割して取得)
     nat_text = tds[4].get_text(separator=' ').strip().split()
     nat_win = safe_float(nat_text[0]) if len(nat_text) > 0 else 0.0
 
@@ -79,12 +73,10 @@ def parse_boat_data(tbody):
     }
 
 def analyze_race(boats):
-    """レースデータを評価し、条件に合致すれば理由のリストを返す"""
     if len(boats) != 6: return []
     b1 = boats[0]
     reasons = []
 
-    # 🚨 【条件A】1号艇の構造的欠陥
     if b1["rank"] in ["B1", "B2"]:
         reasons.append("🎯 1号艇がB級")
     if b1["f_count"] >= 1:
@@ -94,9 +86,8 @@ def analyze_race(boats):
     if b1["nat_win"] > 0 and b1["loc_win"] < (b1["nat_win"] - 1.0):
         reasons.append(f"🌊 1号艇の当地勝率極低 (全国 {b1['nat_win']} / 当地 {b1['loc_win']})")
 
-    # 🚨 【条件B】2〜5コースの明確な破壊者の存在
     if b1["nat_win"] < 5.0:
-        for i in range(1, 5):  # 2号艇(index 1) 〜 5号艇(index 4)
+        for i in range(1, 5):
             b = boats[i]
             if b["nat_win"] >= 6.5 and b["mot_2q"] >= 40.0:
                 reasons.append(f"⚔️ {i+1}号艇に強破壊者 (勝率 {b['nat_win']} / モーター {b['mot_2q']}%)")
@@ -104,79 +95,87 @@ def analyze_race(boats):
 
     return reasons
 
-def send_to_discord(messages):
-    """DiscordのWebhookに結果を送信"""
-    if not DISCORD_WEBHOOK_URL:
-        print("Webhook URLが設定されていないため、標準出力のみ行います。")
+def send_to_discord(race_list):
+    """DiscordのWebhookに結果を安全に送信"""
+    if not DISCORD_WEBHOOK_URL or "http" not in DISCORD_WEBHOOK_URL:
+        print("⚠️ Webhook URLが正しく設定されていません。")
         return
 
-    content = "🚤 **Morning Scanner: 本日のイン崩壊予兆レース** 🚨\n"
-    content += "*(※直前クオンツ分析のターゲット候補)*\n\n"
-    content += "\n".join(messages)
+    header = "🚤 **Morning Scanner: 本日のイン崩壊予兆レース** 🚨\n*(※直前クオンツ分析のターゲット候補)*\n\n"
+    body = "\n".join(race_list)
+    content = header + body
 
-    # Discordの2000文字制限対策（分割処理）
-    if len(content) > 2000:
-        parts = [content[i:i+1900] for i in range(0, len(content), 1900)]
-        for part in parts:
-            requests.post(DISCORD_WEBHOOK_URL, json={"content": part})
-            time.sleep(1)
+    # 2000文字制限対策
+    chunks = []
+    if len(content) > 1900:
+        # 簡易的にメッセージを分割
+        current_chunk = header
+        for race in race_list:
+            if len(current_chunk) + len(race) + 1 > 1900:
+                chunks.append(current_chunk)
+                current_chunk = race + "\n"
+            else:
+                current_chunk += race + "\n"
+        if current_chunk:
+            chunks.append(current_chunk)
     else:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
+        chunks.append(content)
+
+    for i, chunk in enumerate(chunks):
+        try:
+            res = requests.post(DISCORD_WEBHOOK_URL, json={"content": chunk.strip()}, timeout=10)
+            if res.status_code not in [200, 204]:
+                print(f"⚠️ Discord送信エラー (Status: {res.status_code}): {res.text}")
+            else:
+                print(f"✅ Discord送信成功 (チャンク {i+1}/{len(chunks)})")
+            time.sleep(1)
+        except Exception as e:
+            print(f"⚠️ Discord通信例外: {e}")
 
 # ---------------------------------------------------------
 # 🚀 メイン処理
 # ---------------------------------------------------------
 def main():
-    # GitHub ActionsはUTC実行のため、JST(+9時間)で現在日付を取得
     JST = timezone(timedelta(hours=9), 'JST')
     today_str = datetime.now(JST).strftime("%Y%m%d")
     
     print(f"🔍 スキャン開始: {today_str}")
     target_races = []
 
-    # 全24場・全12レースをループ処理
     for jcd in range(1, 25):
         venue_name = VENUE_DICT[jcd]
         
-        # 1Rを取得して、その場でレースが開催されているかチェック
         soup_1r = fetch_racelist(jcd, 1, today_str)
         if not soup_1r:
             print(f"休催 or データ未公開: {venue_name}")
-            time.sleep(0.5)
+            time.sleep(0.3)
             continue
             
         print(f"✅ 開催確認: {venue_name}")
         
-        # 1〜12Rの解析を実行
         for rno in range(1, 13):
-            # 1Rは既に取得済みなら流用、それ以外はFetch
             soup = soup_1r if rno == 1 else fetch_racelist(jcd, rno, today_str)
             if not soup:
-                time.sleep(0.3)
+                time.sleep(0.2)
                 continue
 
             tbodys = soup.find_all('tbody', class_='is-fs12')
             if len(tbodys) < 6:
                 continue
 
-            # 各艇のデータをパース
             boats = []
             for w in range(6):
                 b_data = parse_boat_data(tbodys[w])
                 if b_data: boats.append(b_data)
 
-            # 分析エンジンにかけ、トリガー条件をチェック
             reasons = analyze_race(boats)
             if reasons:
-                # レース情報をストック
                 race_info = f"**【{venue_name} {rno}R】**\n" + "\n".join(f"  └ {r}" for r in reasons)
                 target_races.append(race_info)
                 print(f"  🎯 抽出: {venue_name} {rno}R")
 
-            # サーバー負荷軽減のため意図的にディレイ
-            time.sleep(0.5)
+            time.sleep(0.3)
 
-    # 抽出結果の通知
     if target_races:
         print(f"\n合計 {len(target_races)} レースを抽出しました。Discordへ送信します。")
         send_to_discord(target_races)
