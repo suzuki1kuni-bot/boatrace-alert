@@ -16,11 +16,14 @@ VENUES = [
 ]
 VENUE_DICT = {i + 1: name for i, name in enumerate(VENUES)}
 
-# HTTPリクエスト用のセッションとヘッダー
+# HTTPリクエスト用のセッションと標準ブラウザヘッダー
 SESSION = requests.Session()
 SESSION.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Cache-Control': 'no-cache'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache'
 })
 
 # ---------------------------------------------------------
@@ -34,20 +37,31 @@ def safe_float(text, default=0.0):
         return default
 
 def fetch_racelist(jcd, rno, date_str):
+    """
+    戻り値: (BeautifulSoupオブジェクト or None, ステータス文字列)
+    ステータス: "OK", "NO_DATA", "ERROR: <詳細>"
+    """
     url = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     try:
-        res = SESSION.get(url, timeout=10)
+        res = SESSION.get(url, timeout=15)
         res.raise_for_status()
+        res.encoding = res.apparent_encoding
         if "データがありません" in res.text:
-            return None
-        return BeautifulSoup(res.text, 'html.parser')
+            return None, "NO_DATA"
+        soup = BeautifulSoup(res.text, 'html.parser')
+        # 正常な出走表ページかどうかの最低限の検証
+        if not soup.find('title'):
+            return None, f"ERROR: Empty HTML (len={len(res.text)})"
+        return soup, "OK"
     except Exception as e:
-        print(f"⚠️ 取得エラー (場:{jcd:02d} {rno}R): {e}")
-        return None
+        msg = f"ERROR: {e}"
+        print(f"⚠️ 取得エラー (場:{jcd:02d} {rno}R): {msg}")
+        return None, msg
 
 def parse_boat_data(tbody):
     tds = tbody.find_all('td')
-    if len(tds) < 7: return None
+    if len(tds) < 7:
+        return None
 
     rank_match = re.search(r'(A1|A2|B1|B2)', tds[2].get_text())
     rank = rank_match.group(1) if rank_match else "B1"
@@ -73,7 +87,8 @@ def parse_boat_data(tbody):
     }
 
 def analyze_race(boats):
-    if len(boats) != 6: return []
+    if len(boats) != 6:
+        return []
     b1 = boats[0]
     reasons = []
 
@@ -95,20 +110,21 @@ def analyze_race(boats):
 
     return reasons
 
-def send_to_discord(race_list):
-    """DiscordのWebhookに結果を安全に送信"""
+def send_to_discord(race_list, is_error=False):
     if not DISCORD_WEBHOOK_URL or "http" not in DISCORD_WEBHOOK_URL:
         print("⚠️ Webhook URLが正しく設定されていません。")
         return
 
-    header = "🚤 **Morning Scanner: 本日のイン崩壊予兆レース** 🚨\n*(※直前クオンツ分析のターゲット候補)*\n\n"
+    if is_error:
+        header = "🚨 **Morning Scanner: システム取得エラー検知** 🚨\n\n"
+    else:
+        header = "🚤 **Morning Scanner: 本日のイン崩壊予兆レース** 🚨\n*(※直前クオンツ分析のターゲット候補)*\n\n"
+
     body = "\n".join(race_list)
     content = header + body
 
-    # 2000文字制限対策
     chunks = []
     if len(content) > 1900:
-        # 簡易的にメッセージを分割
         current_chunk = header
         for race in race_list:
             if len(current_chunk) + len(race) + 1 > 1900:
@@ -138,35 +154,49 @@ def send_to_discord(race_list):
 def main():
     JST = timezone(timedelta(hours=9), 'JST')
     today_str = datetime.now(JST).strftime("%Y%m%d")
-    
+
     print(f"🔍 スキャン開始: {today_str}")
     target_races = []
+    active_venues = 0
+    error_logs = []
 
     for jcd in range(1, 25):
         venue_name = VENUE_DICT[jcd]
-        
-        soup_1r = fetch_racelist(jcd, 1, today_str)
-        if not soup_1r:
-            print(f"休催 or データ未公開: {venue_name}")
-            time.sleep(0.3)
+
+        soup_1r, status_1r = fetch_racelist(jcd, 1, today_str)
+        if status_1r != "OK":
+            if status_1r.startswith("ERROR"):
+                error_logs.append(f"{venue_name}: {status_1r}")
+            else:
+                print(f"休催 or データ未公開: {venue_name}")
+            time.sleep(0.5)
             continue
-            
+
+        active_venues += 1
         print(f"✅ 開催確認: {venue_name}")
-        
+
         for rno in range(1, 13):
-            soup = soup_1r if rno == 1 else fetch_racelist(jcd, rno, today_str)
-            if not soup:
-                time.sleep(0.2)
+            if rno == 1:
+                soup, status = soup_1r, status_1r
+            else:
+                soup, status = fetch_racelist(jcd, rno, today_str)
+
+            if status != "OK" or not soup:
+                if status.startswith("ERROR"):
+                    error_logs.append(f"{venue_name} {rno}R: {status}")
+                time.sleep(0.3)
                 continue
 
             tbodys = soup.find_all('tbody', class_='is-fs12')
             if len(tbodys) < 6:
+                error_logs.append(f"{venue_name} {rno}R: HTML構造不一致 (tbodys={len(tbodys)})")
                 continue
 
             boats = []
             for w in range(6):
                 b_data = parse_boat_data(tbodys[w])
-                if b_data: boats.append(b_data)
+                if b_data:
+                    boats.append(b_data)
 
             reasons = analyze_race(boats)
             if reasons:
@@ -174,14 +204,20 @@ def main():
                 target_races.append(race_info)
                 print(f"  🎯 抽出: {venue_name} {rno}R")
 
-            time.sleep(0.3)
+            time.sleep(0.4)
 
-    if target_races:
-        print(f"\n合計 {len(target_races)} レースを抽出しました。Discordへ送信します。")
+    print(f"\nスキャン完了 | 開催場数: {active_venues}場 | 抽出: {len(target_races)}レース | エラー: {len(error_logs)}件")
+
+    if active_venues == 0:
+        err_summary = error_logs[:5] if error_logs else ["全24場でデータ未取得（日付またはHTML変更の可能性）"]
+        send_to_discord(err_summary, is_error=True)
+    elif target_races:
         send_to_discord(target_races)
     else:
-        print("\n本日はイン崩壊条件に合致するレースはありませんでした。")
-        send_to_discord(["✅ 本日はイン崩壊の予兆（監視対象）レースはありません。資金を温存します。"])
+        msg = [f"✅ 本日はイン崩壊の予兆（監視対象）レースはありません。（確認済み開催場: {active_venues}場）"]
+        if error_logs:
+            msg.append(f"⚠️ 一部取得エラーあり ({len(error_logs)}件): {error_logs[0]}")
+        send_to_discord(msg)
 
 if __name__ == "__main__":
     main()
