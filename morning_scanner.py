@@ -27,13 +27,11 @@ LOCAL_BRANCH = {
 # 場特性分類（モジュール5）
 NARROW_VENUES = {2, 3, 4}       # 戸田・江戸川・平和島（狭い水面・イン不利）
 WIDE_VENUES = {18, 21, 24}      # 徳山・芦屋・大村（広い水面・イン60%超）
-FRESH_VENUES = {1, 2, 5, 11}    # 主な淡水（桐生・戸田・多摩川・びわこ ※住之江/尼崎等も含むが代表例）
+FRESH_VENUES = {1, 2, 5, 11}    # 主な淡水（桐生・戸田・多摩川・びわこ）
 
 BRANCH_REGEX = re.compile(
     r'(群馬|埼玉|東京|静岡|愛知|三重|福井|滋賀|大阪|兵庫|徳島|香川|岡山|広島|山口|福岡|佐賀|長崎)\s*/'
 )
-
-MAX_TARGET_RACES = 15  # 1日の厳選出力上限
 
 # HTTPリクエスト用のセッションと標準ブラウザヘッダー
 SESSION = requests.Session()
@@ -54,6 +52,11 @@ def safe_float(text, default=0.0):
         return float(clean) if clean else default
     except Exception:
         return default
+
+def normalize_time(deadline):
+    if re.match(r'^\d{1,2}:\d{2}$', str(deadline)):
+        return deadline if len(deadline) == 5 else "0" + deadline
+    return "99:99"
 
 def fetch_racelist(jcd, rno, date_str):
     url = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}"
@@ -123,8 +126,7 @@ def parse_boat_data(tbody):
 
 def evaluate_quant_race(jcd, rno, deadline, boats):
     """
-    クオンツ事前精査ロジック
-    戻り値: None（足切り） または スコアと要約辞書
+    クオンツ事前精査ロジック（件数制限なし・スコア3以上を全抽出）
     """
     if len(boats) != 6:
         return None
@@ -140,12 +142,10 @@ def evaluate_quant_race(jcd, rno, deadline, boats):
     tags = []
     details = []
 
-    # 環境タグ
     env_tag = "狭" if jcd in NARROW_VENUES else ("広" if jcd in WIDE_VENUES else ("淡" if jcd in FRESH_VENUES else "並"))
 
-    # 外枠の脅威確認（ST差・強破壊者）
-    outer_min_st = min(b["avg_st"] for b in boats[1:4])  # 2〜4コース最速ST
-    st_gap = round(b1["avg_st"] - outer_min_st, 2)       # プラスなら1号艇がST劣勢
+    outer_min_st = min(b["avg_st"] for b in boats[1:4])
+    st_gap = round(b1["avg_st"] - outer_min_st, 2)
 
     has_4_destroyer = (boats[3]["rank"] == "A1" or (boats[3]["nat_win"] >= 6.3 and boats[3]["mot_2q"] >= 38.0))
     has_outer_destroyer = any(
@@ -160,7 +160,7 @@ def evaluate_quant_race(jcd, rno, deadline, boats):
             details.append("B1地元(+6.26pt)")
 
     if b1["rank"] in ["A1", "A2"] and b1["f_count"] == 0:
-        if (0 < b1["mot_2q"] < 30.0) or (b1["nat_win"] >= 5.5 and b1["loc_win"] < b1["nat_win"] - 1.5):
+        if (0 < b1["mot_2q"] < 30.0) or (b1["nat_win"] >= 5.0 and b1["loc_win"] < b1["nat_win"] - 1.5):
             score += 3
             if "逆張ｲﾝ" not in tags:
                 tags.append("逆張ｲﾝ")
@@ -171,8 +171,12 @@ def evaluate_quant_race(jcd, rno, deadline, boats):
 
     # 2. 【イン崩壊・荒れ歪み】チェック
     if jcd in NARROW_VENUES and b1["rank"] in ["B1", "B2"]:
-        if b1["nat_win"] < 5.2 or b1["avg_st"] >= 0.17 or b1["f_count"] >= 1:
+        if b1["nat_win"] < 5.0:
             score += 4
+            tags.append("ｲﾝ崩壊")
+            details.append(f"{b1['rank']}(全{b1['nat_win']})")
+        elif b1["nat_win"] < 5.5 or b1["avg_st"] >= 0.18 or b1["f_count"] >= 1:
+            score += 3
             tags.append("ｲﾝ崩壊")
             details.append(f"{b1['rank']}(全{b1['nat_win']})")
 
@@ -182,7 +186,8 @@ def evaluate_quant_race(jcd, rno, deadline, boats):
             tags.append("ｲﾝ崩壊")
         details.append(f"F{b1['f_count']}")
 
-    if st_gap >= 0.03:
+    # 1号艇の平均STが0.16以上で外枠に0.03秒以上遅れている場合のみ加点
+    if b1["avg_st"] >= 0.16 and st_gap >= 0.03:
         score += 3
         if "ｲﾝ崩壊" not in tags:
             tags.append("ｲﾝ崩壊")
@@ -198,23 +203,19 @@ def evaluate_quant_race(jcd, rno, deadline, boats):
         score += 3
         tags.append("5・6ﾛｯｸ")
 
-    # 基本情報の補足（1号艇スペック重複整理）
-    base_b1 = f"1:{b1['rank']}/ST{b1['avg_st']:.2f}/M{b1['mot_2q']}%"
+    # 広水面で1号艇がB1非地元かつ低モーター等の場合
+    if jcd in WIDE_VENUES and b1["rank"] in ["B1", "B2"] and not is_b1_local and (0 < b1["mot_2q"] < 30.0):
+        score += 2
 
-    # 最低ライン（スコア3未満は凡戦ノイズとして足切り）
     if score < 3:
         return None
 
-    # ランク判定
+    base_b1 = f"1:{b1['rank']}/ST{b1['avg_st']:.2f}/M{b1['mot_2q']}%"
     rank_label = "S" if score >= 6 else "A"
     tag_str = "".join(f"[{t}]" for t in tags[:2])
     detail_str = " ".join(details[:2])
 
-    # ソート用の時刻キー（HH:MM形式でない場合は99:99）
-    sort_time = deadline if re.match(r'^\d{1,2}:\d{2}$', deadline) else "99:99"
-    if len(sort_time) == 4:
-        sort_time = "0" + sort_time
-
+    sort_time = normalize_time(deadline)
     line = f"[{deadline}][{rank_label}/{env_tag}]{venue_name}{rno}R {base_b1} {tag_str} {detail_str}".strip()
 
     return {
@@ -269,9 +270,11 @@ def send_to_discord(race_lines, is_error=False):
 # ---------------------------------------------------------
 def main():
     JST = timezone(timedelta(hours=9), 'JST')
-    today_str = datetime.now(JST).strftime("%Y%m%d")
+    now_jst = datetime.now(JST)
+    today_str = now_jst.strftime("%Y%m%d")
+    now_hm = now_jst.strftime("%H:%M")
 
-    print(f"🔍 クオンツ事前スキャン開始: {today_str}")
+    print(f"🔍 クオンツ事前スキャン開始: {today_str} (現在時刻 {now_hm} JST)")
     candidates = []
     active_venues = 0
     error_logs = []
@@ -289,7 +292,6 @@ def main():
             continue
 
         deadlines = parse_deadlines(soup_1r)
-        # 全レース中止判定（1R〜12Rの締切欄がすべて中止の場合等）
         if deadlines and all("中止" in v for v in deadlines.values()):
             print(f"全レース中止: {venue_name}")
             time.sleep(0.3)
@@ -301,6 +303,11 @@ def main():
         for rno in range(1, 13):
             deadline = deadlines.get(rno, "--:--")
             if "中止" in deadline:
+                continue
+
+            sort_time = normalize_time(deadline)
+            # すでに締切時刻を過ぎているレースはスキップ
+            if sort_time != "99:99" and sort_time < now_hm:
                 continue
 
             if rno == 1:
@@ -327,24 +334,22 @@ def main():
             res = evaluate_quant_race(jcd, rno, deadline, boats)
             if res:
                 candidates.append(res)
-                print(f"  🎯 特選候補 (Score {res['score']}): {res['line']}")
+                print(f"  🎯 抽出 (Score {res['score']}): {res['line']}")
 
             time.sleep(0.4)
 
-    # スコア上位 MAX_TARGET_RACES 件を抽出し、締切時刻順へソート
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    selected = candidates[:MAX_TARGET_RACES]
-    selected.sort(key=lambda x: x["sort_time"])
+    # 上限撤廃：基準を満たす全レースを締切時刻順へソートして全件出力
+    candidates.sort(key=lambda x: (x["sort_time"], -x["score"]))
 
-    print(f"\nスキャン完了 | 開催場数: {active_venues}場 | 候補総数: {len(candidates)} | 厳選出力: {len(selected)}件 | エラー: {len(error_logs)}件")
+    print(f"\nスキャン完了 | 開催場数: {active_venues}場 | 抽出: {len(candidates)}件 | エラー: {len(error_logs)}件")
 
     if active_venues == 0:
         err_summary = error_logs[:5] if error_logs else ["全24場でデータ未取得（日付またはHTML変更の可能性）"]
         send_to_discord(err_summary, is_error=True)
-    elif selected:
-        send_to_discord([item["line"] for item in selected])
+    elif candidates:
+        send_to_discord([item["line"] for item in candidates])
     else:
-        msg = [f"✅ 本日はクオンツ事前基準（Score>=3）を満たす特選ターゲットはありません。（確認済み開催場: {active_venues}場）"]
+        msg = [f"✅ 残存レースにクオンツ事前基準（Score>=3）を満たす対象はありません。（確認済み開催場: {active_venues}場）"]
         if error_logs:
             msg.append(f"⚠️ 一部取得エラーあり ({len(error_logs)}件): {error_logs[0]}")
         send_to_discord(msg)
