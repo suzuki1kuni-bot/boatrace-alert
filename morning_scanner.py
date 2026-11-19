@@ -24,16 +24,14 @@ LOCAL_BRANCH = {
     19: "山口", 20: "福岡", 21: "福岡", 22: "福岡", 23: "佐賀", 24: "長崎"
 }
 
-# 場特性分類（モジュール5）
-NARROW_VENUES = {2, 3, 4}       # 戸田・江戸川・平和島（狭い水面・イン不利）
+NARROW_VENUES = {2, 3, 4}       # 戸田・江戸川・平和島（狭い水面）
 WIDE_VENUES = {18, 21, 24}      # 徳山・芦屋・大村（広い水面・イン60%超）
-FRESH_VENUES = {1, 2, 5, 11}    # 主な淡水（桐生・戸田・多摩川・びわこ）
+FRESH_VENUES = {1, 2, 5, 11}    # 主な淡水
 
 BRANCH_REGEX = re.compile(
     r'(群馬|埼玉|東京|静岡|愛知|三重|福井|滋賀|大阪|兵庫|徳島|香川|岡山|広島|山口|福岡|佐賀|長崎)\s*/'
 )
 
-# HTTPリクエスト用のセッションと標準ブラウザヘッダー
 SESSION = requests.Session()
 SESSION.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -114,6 +112,21 @@ def parse_boat_data(tbody):
     mot_text = tds[6].get_text(separator=' ').strip().split()
     mot_2q = safe_float(mot_text[1]) if len(mot_text) > 1 else 0.0
 
+    # 今節成績のSTと着順を取得（trs[2]: ST行, trs[3]: 着順行）
+    recent_sts = []
+    recent_ranks = []
+    trs = tbody.find_all('tr')
+    if len(trs) >= 4:
+        for td in trs[2].find_all('td'):
+            t = td.get_text(strip=True)
+            m = re.search(r'\.(\d{2})', t)
+            if m:
+                recent_sts.append(float("0." + m.group(1)))
+        for td in trs[3].find_all('td'):
+            t = td.get_text(strip=True)
+            if re.match(r'^[1-6]$', t):
+                recent_ranks.append(int(t))
+
     return {
         "rank": rank,
         "branch": branch,
@@ -121,12 +134,14 @@ def parse_boat_data(tbody):
         "avg_st": avg_st,
         "nat_win": nat_win,
         "loc_win": loc_win,
-        "mot_2q": mot_2q
+        "mot_2q": mot_2q,
+        "recent_sts": recent_sts,
+        "recent_ranks": recent_ranks
     }
 
-def evaluate_quant_race(jcd, rno, deadline, boats):
+def evaluate_quant_v3(jcd, rno, deadline, boats):
     """
-    クオンツ事前精査ロジック（件数制限なし・スコア3以上を全抽出）
+    Quant Scanner v3: 大衆の錯覚・非対称エッジ特化スクリーナー
     """
     if len(boats) != 6:
         return None
@@ -137,86 +152,113 @@ def evaluate_quant_race(jcd, rno, deadline, boats):
     venue_name = VENUE_DICT[jcd]
     local_branch = LOCAL_BRANCH.get(jcd, "")
     is_b1_local = (b1["branch"] == local_branch and local_branch != "")
+    is_all_a1 = all(b["rank"] == "A1" for b in boats)
 
     score = 0
     tags = []
-    details = []
+    notes = []
 
     env_tag = "狭" if jcd in NARROW_VENUES else ("広" if jcd in WIDE_VENUES else ("淡" if jcd in FRESH_VENUES else "並"))
+    if is_all_a1:
+        env_tag += "/G1"
 
-    outer_min_st = min(b["avg_st"] for b in boats[1:4])
-    st_gap = round(b1["avg_st"] - outer_min_st, 2)
+    # -----------------------------------------------------
+    # 1. 【A級イン死角】大衆のA1/A2過信の裏を撃つ
+    # -----------------------------------------------------
+    if b1["rank"] in ["A1", "A2"] and not is_all_a1:
+        sub_score = 0
+        sub_notes = []
+        if b1["f_count"] >= 1:
+            sub_score += 4
+            sub_notes.append(f"F{b1['f_count']}")
+        if b1["avg_st"] >= 0.17 and any(b["avg_st"] <= 0.14 for b in boats[1:4]):
+            sub_score += 3
+            sub_notes.append(f"ST劣({b1['avg_st']:.2f})")
+        if 0 < b1["mot_2q"] < 28.0:
+            sub_score += 2
+            sub_notes.append(f"M{b1['mot_2q']}%")
+        if b1["loc_win"] > 0 and b1["loc_win"] < (b1["nat_win"] - 1.5):
+            sub_score += 2
+            sub_notes.append(f"当{b1['loc_win']}")
 
-    has_4_destroyer = (boats[3]["rank"] == "A1" or (boats[3]["nat_win"] >= 6.3 and boats[3]["mot_2q"] >= 38.0))
-    has_outer_destroyer = any(
-        b["nat_win"] >= 6.3 and b["mot_2q"] >= 38.0 for b in boats[4:6]
-    )
+        # 外枠に攻め手（高モーター or 高ST）がいれば死角完成
+        if sub_score >= 2 and any(b["mot_2q"] >= 38.0 or b["avg_st"] <= 0.14 for b in boats[1:4]):
+            score += sub_score + 1
+            tags.append("A級ｲﾝ死角")
+            notes.extend(sub_notes[:2])
 
-    # 1. 【逆張りイン高EV期待】チェック
-    if b1["rank"] == "B1" and is_b1_local and b1["f_count"] == 0 and b1["avg_st"] <= 0.16:
-        if jcd in WIDE_VENUES or b1["nat_win"] >= 4.5:
-            score += 4
-            tags.append("逆張ｲﾝ")
-            details.append("B1地元(+6.26pt)")
+    # -----------------------------------------------------
+    # 2. 【広水面B1地元先制】大衆のA級信仰の裏（逆張りイン）
+    # -----------------------------------------------------
+    if jcd in WIDE_VENUES and b1["rank"] == "B1" and is_b1_local:
+        has_outer_a = any(b["rank"] in ["A1", "A2"] for b in boats[1:6])
+        if has_outer_a and b1["f_count"] == 0 and b1["avg_st"] <= 0.16 and (b1["mot_2q"] >= 30.0 or b1["mot_2q"] == 0):
+            score += 5
+            tags.append("広B1地元")
+            notes.append("外A吸/地元+6.26")
 
-    if b1["rank"] in ["A1", "A2"] and b1["f_count"] == 0:
-        if (0 < b1["mot_2q"] < 30.0) or (b1["nat_win"] >= 5.0 and b1["loc_win"] < b1["nat_win"] - 1.5):
-            score += 3
-            if "逆張ｲﾝ" not in tags:
-                tags.append("逆張ｲﾝ")
-            if 0 < b1["mot_2q"] < 30.0:
-                details.append(f"M{b1['mot_2q']}%")
-            if b1["loc_win"] < b1["nat_win"] - 1.5:
-                details.append(f"全{b1['nat_win']}/当{b1['loc_win']}")
+    # -----------------------------------------------------
+    # 3. 【壁崩壊→隣先制】相対STギャップ（0.17以上 vs 0.14以下）
+    # -----------------------------------------------------
+    for wall_idx in [1, 2]:  # 2コース(idx1), 3コース(idx2)
+        wall = boats[wall_idx]
+        attacker = boats[wall_idx + 1]  # 3コース(idx2) or 4コース(idx3)
 
-    # 2. 【イン崩壊・荒れ歪み】チェック
-    if jcd in NARROW_VENUES and b1["rank"] in ["B1", "B2"]:
-        if b1["nat_win"] < 5.0:
-            score += 4
-            tags.append("ｲﾝ崩壊")
-            details.append(f"{b1['rank']}(全{b1['nat_win']})")
-        elif b1["nat_win"] < 5.5 or b1["avg_st"] >= 0.18 or b1["f_count"] >= 1:
-            score += 3
-            tags.append("ｲﾝ崩壊")
-            details.append(f"{b1['rank']}(全{b1['nat_win']})")
+        wall_recent_slow = (len(wall["recent_sts"]) >= 2 and (sum(wall["recent_sts"][-2:]) / 2) >= 0.19)
+        wall_weak = (wall["avg_st"] >= 0.17 or wall_recent_slow or wall["f_count"] >= 1)
 
-    if b1["f_count"] >= 1:
-        score += 3
-        if "ｲﾝ崩壊" not in tags:
-            tags.append("ｲﾝ崩壊")
-        details.append(f"F{b1['f_count']}")
+        att_recent_fast = (len(attacker["recent_sts"]) >= 2 and (sum(attacker["recent_sts"][-2:]) / 2) <= 0.13)
+        att_strong = (attacker["avg_st"] <= 0.14 or att_recent_fast)
+        att_capable = (attacker["nat_win"] >= 5.0 or attacker["mot_2q"] >= 35.0)
 
-    # 1号艇の平均STが0.16以上で外枠に0.03秒以上遅れている場合のみ加点
-    if b1["avg_st"] >= 0.16 and st_gap >= 0.03:
-        score += 3
-        if "ｲﾝ崩壊" not in tags:
-            tags.append("ｲﾝ崩壊")
-        details.append(f"ST差+{st_gap:.2f}")
+        if wall_weak and att_strong and att_capable and (wall["avg_st"] - attacker["avg_st"] >= 0.03 or att_recent_fast):
+            add = 4 if attacker["rank"] in ["B1", "A2"] else 3  # 目立ちにくいB1/A2の隣先制をより高く評価
+            score += add
+            tags.append("壁崩壊")
+            notes.append(f"{wall_idx+1}凹→{wall_idx+2}({attacker['rank']})")
+            break
 
-    # 3. 【大衆罠・決まり手ロック】チェック
-    if b1["rank"] in ["B1", "B2"] and has_4_destroyer:
-        score += 2
-        tags.append("4ｶﾄﾞ罠")
-        details.append(f"4:{boats[3]['rank']}({boats[3]['nat_win']})")
+    # -----------------------------------------------------
+    # 4. 【外枠A級の周辺認知差し】1M渋滞時の真空突入
+    # -----------------------------------------------------
+    inner_slow_count = sum(1 for b in boats[:3] if b["avg_st"] >= 0.16)
+    if inner_slow_count >= 2 or (b1["rank"] in ["B1", "A2"] and boats[1]["rank"] in ["B1", "A2"]):
+        for out_idx in [4, 5]:  # 5コース(idx4), 6コース(idx5)
+            out_b = boats[out_idx]
+            if out_b["rank"] == "A1" or (out_b["rank"] == "A2" and out_b["nat_win"] >= 6.2):
+                # 全員A1戦でない場合ほど大衆が5・6を軽視するため加点
+                add = 3 if is_all_a1 else 4
+                score += add
+                tags.append("外A級差")
+                notes.append(f"{out_idx+1}:{out_b['rank']}({out_b['nat_win']})")
+                break
 
-    if jcd in WIDE_VENUES and has_outer_destroyer:
-        score += 3
-        tags.append("5・6ﾛｯｸ")
+    # -----------------------------------------------------
+    # 5. 【今節ST急上昇の伏兵】古い数字と実戦気配の乖離
+    # -----------------------------------------------------
+    for idx in range(1, 5):  # 2〜5コース
+        b = boats[idx]
+        if b["nat_win"] < 5.5 and b["mot_2q"] < 34.0 and len(b["recent_sts"]) >= 2 and len(b["recent_ranks"]) >= 2:
+            last2_st = sum(b["recent_sts"][-2:]) / 2
+            has_ren = any(r <= 2 for r in b["recent_ranks"][-2:])
+            if last2_st <= 0.13 and has_ren:
+                score += 3
+                tags.append("今節気配")
+                notes.append(f"{idx+1}ST{last2_st:.2f}")
+                break
 
-    # 広水面で1号艇がB1非地元かつ低モーター等の場合
-    if jcd in WIDE_VENUES and b1["rank"] in ["B1", "B2"] and not is_b1_local and (0 < b1["mot_2q"] < 30.0):
-        score += 2
-
-    if score < 3:
+    # 閾値判定（ノイズ排除のためスコア4以上を抽出、全員A1戦は5以上）
+    min_score = 5 if is_all_a1 else 4
+    if score < min_score:
         return None
 
-    base_b1 = f"1:{b1['rank']}/ST{b1['avg_st']:.2f}/M{b1['mot_2q']}%"
-    rank_label = "S" if score >= 6 else "A"
+    rank_label = "S" if score >= 7 else "A"
+    base_b1 = f"1:{b1['rank']}(ST{b1['avg_st']:.2f}/M{b1['mot_2q']}%)"
     tag_str = "".join(f"[{t}]" for t in tags[:2])
-    detail_str = " ".join(details[:2])
-
+    note_str = " ".join(notes[:2])
     sort_time = normalize_time(deadline)
-    line = f"[{deadline}][{rank_label}/{env_tag}]{venue_name}{rno}R {base_b1} {tag_str} {detail_str}".strip()
+
+    line = f"[{deadline}][{rank_label}/{env_tag}]{venue_name}{rno}R {base_b1} {tag_str} {note_str}".strip()
 
     return {
         "score": score,
@@ -230,9 +272,9 @@ def send_to_discord(race_lines, is_error=False):
         return
 
     if is_error:
-        header = "🚨 **Morning Scanner: システム取得エラー検知** 🚨\n"
+        header = "🚨 **Quant Scanner v3: システム取得エラー検知** 🚨\n"
     else:
-        header = "📊 **Quant Pre-Screener: 本日の特選ターゲット（締切順）**\n"
+        header = "🎯 **Quant Scanner v3: 大衆錯覚ターゲット（締切順）**\n"
 
     max_len = 900
     chunks = []
@@ -274,7 +316,7 @@ def main():
     today_str = now_jst.strftime("%Y%m%d")
     now_hm = now_jst.strftime("%H:%M")
 
-    print(f"🔍 クオンツ事前スキャン開始: {today_str} (現在時刻 {now_hm} JST)")
+    print(f"🔍 Quant Scanner v3 開始: {today_str} (現在時刻 {now_hm} JST)")
     candidates = []
     active_venues = 0
     error_logs = []
@@ -306,7 +348,6 @@ def main():
                 continue
 
             sort_time = normalize_time(deadline)
-            # すでに締切時刻を過ぎているレースはスキップ
             if sort_time != "99:99" and sort_time < now_hm:
                 continue
 
@@ -331,14 +372,13 @@ def main():
                 if b_data:
                     boats.append(b_data)
 
-            res = evaluate_quant_race(jcd, rno, deadline, boats)
+            res = evaluate_quant_v3(jcd, rno, deadline, boats)
             if res:
                 candidates.append(res)
                 print(f"  🎯 抽出 (Score {res['score']}): {res['line']}")
 
             time.sleep(0.4)
 
-    # 上限撤廃：基準を満たす全レースを締切時刻順へソートして全件出力
     candidates.sort(key=lambda x: (x["sort_time"], -x["score"]))
 
     print(f"\nスキャン完了 | 開催場数: {active_venues}場 | 抽出: {len(candidates)}件 | エラー: {len(error_logs)}件")
@@ -349,7 +389,7 @@ def main():
     elif candidates:
         send_to_discord([item["line"] for item in candidates])
     else:
-        msg = [f"✅ 残存レースにクオンツ事前基準（Score>=3）を満たす対象はありません。（確認済み開催場: {active_venues}場）"]
+        msg = [f"✅ 残存レースにQuant Scanner v3基準（Score>=4）を満たす歪み候補はありません。（確認済み開催場: {active_venues}場）"]
         if error_logs:
             msg.append(f"⚠️ 一部取得エラーあり ({len(error_logs)}件): {error_logs[0]}")
         send_to_discord(msg)
